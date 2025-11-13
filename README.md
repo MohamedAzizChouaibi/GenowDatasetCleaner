@@ -29,7 +29,7 @@ Ce projet nécessite les bibliothèques Python suivantes. Elles sont listées da
 
 1.  **Cloner le dépôt**:
     ```bash
-    git clone [URL_DU_DÉPÔT]
+    git clone https://github.com/MohamedAzizChouaibi/GenowDatasetCleaner
     cd GenowDatasetCleaner
     ```
 
