@@ -1,29 +1,47 @@
 # GenowDatasetCleaner
 
-**GenowDatasetCleaner** est une application de bureau simple et efficace, construite avec Python et Tkinter, conçue pour aider à nettoyer et à organiser les grands ensembles de données d'images. Il utilise des techniques avancées de vision par ordinateur, y compris le modèle **CLIP** (Contrastive Language-Image Pre-training) de OpenAI, pour identifier et signaler les images de mauvaise qualité ou redondantes.
+**GenowDatasetCleaner** est une application de bureau (Python + Tkinter) conçue pour nettoyer et organiser des datasets d'images au format **YOLOv11 / YOLOv12** (Ultralytics). Elle détecte les images de mauvaise qualité (floues, sur/sous-exposées, peu informatives) et les doublons à l'aide d'embeddings visuels (**CLIP** par défaut, plusieurs autres VLM disponibles), puis permet de les supprimer en conservant les fichiers de labels YOLO (`.txt`) associés.
+
+Un dossier est reconnu comme dataset YOLO s'il contient soit un `data.yaml` avec les clés `train:` et `names:`/`nc:`, soit des répertoires parallèles `images/` et `labels/`.
 
 ## Fonctionnalités
 
-*   **Détection de Doublons**: Utilise les embeddings CLIP pour calculer la similarité cosinus entre les images et identifier les doublons potentiels.
-*   **Analyse de Qualité**:
-    *   Détection des images **floues** (en utilisant la variance du Laplacien).
-    *   Détection des images **sombres** ou **trop claires** (en analysant la luminosité moyenne).
-    *   Détection des images à **faible information** (en analysant l'écart-type des pixels).
-*   **Interface Utilisateur Graphique (GUI)**: Une interface conviviale basée sur Tkinter pour sélectionner le dossier du dataset, lancer l'analyse et visualiser les résultats.
-*   **Nettoyage Automatisé**: Option de suppression des images identifiées comme problématiques (doublons, floues, etc.) et de leurs fichiers XML associés.
+*   **Détection de doublons**: pré-passe par hachage perceptuel (pHash) pour les doublons exacts, puis clustering par similarité cosinus sur les embeddings VLM.
+*   **Embedders multiples** (sélectionnables dans l'interface ou via `--embedder`):
+    *   **CLIP** ViT-B/32, ViT-B/16, ViT-L/14 (OpenAI, par défaut).
+    *   **OpenCLIP** (nécessite `open_clip_torch`).
+    *   **SigLIP** et **DINOv2** (nécessitent `transformers`).
+    *   **API hébergées** (nécessitent une clé API + `requests`): Jina CLIP v2, Voyage multimodal-3, et VLM par légende — Qwen-VL, OpenAI GPT-4o-mini, Claude, Gemini.
+*   **Analyse de qualité**:
+    *   Images **floues** (variance du Laplacien).
+    *   Images **trop sombres** / **trop claires** (luminosité moyenne).
+    *   Images à **faible information** (écart-type des pixels).
+*   **Filtre par nom**: signale les fichiers contenant les tokens `det` / `seg`.
+*   **Suppression sûre**: corbeille système (`send2trash`) ou dossier de quarantaine, avec **annulation** (undo) de la dernière suppression.
+*   **Interface graphique** (Tkinter) et **mode CLI** sans affichage.
+*   **Rapport JSON** généré automatiquement après chaque analyse.
 
 ## Dépendances
 
-Ce projet nécessite les bibliothèques Python suivantes. Elles sont listées dans le fichier `requirements.txt`.
+Listées dans `requirements.txt`.
 
-*   `pandas`
+**Obligatoires**:
+
 *   `numpy`
 *   `opencv-python` (cv2)
 *   `Pillow` (PIL)
-*   `matplotlib`
-*   `scikit-learn`
 *   `torch`
-*   `clip`
+*   `send2trash` — suppression vers la corbeille système
+*   `imagehash` — pré-passe par hachage perceptuel
+*   `clip` (installé depuis `git+https://github.com/openai/CLIP.git`)
+
+`tkinter` est requis pour l'interface graphique (inclus avec Python sur la plupart des plateformes ; sous Debian/Ubuntu : `sudo apt install python3-tk`).
+
+**Optionnelles** (installer uniquement les backends souhaités) :
+
+*   `open_clip_torch` — embedders `openclip:*`
+*   `transformers` — embedders `siglip:*` / `dinov2:*` et embedders par légende (API)
+*   `requests` — tout embedder via API (Jina, Voyage, Qwen-VL, OpenAI, Anthropic, Gemini)
 
 ## Installation
 
@@ -45,33 +63,55 @@ Ce projet nécessite les bibliothèques Python suivantes. Elles sont listées da
     pip install -r requirements.txt
     ```
 
-    **Note sur PyTorch et CLIP**: L'installation de `torch` et `clip` peut nécessiter des étapes spécifiques en fonction de votre configuration (CPU ou GPU). Veuillez consulter la documentation officielle de PyTorch et du modèle CLIP si vous rencontrez des problèmes.
+    **Note sur PyTorch et CLIP**: l'installation de `torch` peut nécessiter des étapes spécifiques selon votre configuration (CPU ou GPU). Consultez la documentation officielle de PyTorch et de CLIP en cas de problème. Le GPU (CUDA) est utilisé automatiquement s'il est disponible, sinon le CPU.
 
 ## Utilisation
 
-1.  **Lancer l'application**:
-    ```bash
-    python genowCleaner.py
-    ```
+### Interface graphique
 
-2.  **Sélectionner le Dataset**: Cliquez sur "Parcourir" pour choisir le dossier racine de votre dataset d'images.
-3.  **Démarrer l'Analyse**: Cliquez sur "Démarrer l'Analyse". L'application va:
-    *   Collecter les images (`.jpg`, `.jpeg`, `.png`).
-    *   Supprimer les images contenant "det" ou "seg" dans leur nom de fichier (et leurs XML associés).
+```bash
+python genowCleaner.py
+```
+
+1.  **Sélectionner le dataset**: cliquez sur "Browse…" pour choisir le dossier racine du dataset YOLO.
+2.  **Régler les paramètres** (seuils de flou, luminosité, doublons, embedder, nombre de workers, clés API…).
+3.  **Lancer l'analyse**: "Analyze dataset". L'application va:
+    *   Collecter les images (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`).
+    *   Signaler les fichiers contenant `det` / `seg` (optionnel).
     *   Calculer les scores de qualité (flou, luminosité, information).
-    *   Calculer les embeddings CLIP et identifier les doublons.
-4.  **Visualiser et Nettoyer**:
-    *   Le résumé affichera le nombre d'images problématiques trouvées.
-    *   Utilisez les boutons de visualisation pour inspecter les images signalées.
-    *   Cliquez sur le bouton rouge "Terminer le Nettoyage (Supprimer les Images)" pour supprimer définitivement les images identifiées.
+    *   Calculer les embeddings et regrouper les doublons.
+4.  **Visualiser et nettoyer**:
+    *   Les cartes de résultats affichent le nombre d'images par catégorie.
+    *   "Review" pour inspecter et sélectionner les images à supprimer.
+    *   "Auto-clean" pour conserver automatiquement la meilleure image de chaque cluster de doublons.
+    *   La suppression retire aussi le fichier de label YOLO (`.txt`) associé. "Undo last delete" restaure la dernière suppression (quarantaine uniquement).
 
-## Structure du Projet
+### Mode CLI (sans affichage)
+
+```bash
+python genowCleaner.py --cli /chemin/vers/dataset
+```
+
+Options principales:
+
+*   `--report CHEMIN` — emplacement du rapport JSON (par défaut `~/.genow_cleaner/reports/`).
+*   `--auto-clean-duplicates` — conserve la meilleure image par cluster, supprime les autres.
+*   `--embedder CLE` — choix de l'embedder (ex. `clip:ViT-B/32`, `dinov2:base`…).
+*   `--blur-threshold`, `--dark-threshold`, `--bright-threshold`, `--low-info-threshold`, `--duplicate-threshold` — seuils.
+*   `--workers N` — nombre de threads.
+*   `--no-phash` — désactive la pré-passe par hachage perceptuel.
+*   `--use-trash` — utilise la corbeille système au lieu de la quarantaine.
+
+## Structure du projet
 
 ```
 GenowDatasetCleaner/
-├── genowCleaner.py         # Le script principal de l'application
-├── requirements.txt        # Liste des dépendances Python
+├── genowCleaner.py         # Application principale (GUI + CLI)
+├── embedders.py            # Embedders locaux (CLIP, OpenCLIP, SigLIP, DINOv2)
+├── api_embedders.py        # Embedders via API (Jina, Voyage, Qwen-VL, OpenAI, Claude, Gemini)
+├── tests/                  # Tests
+├── requirements.txt        # Dépendances Python
+├── genow_logo.jpeg         # Logo de l'application
 ├── README.md               # Ce fichier
-├── .gitignore              # Fichiers et dossiers à ignorer par Git
-└── LICENSE                 # Licence du projet (à ajouter)
+└── LICENSE                 # Licence du projet
 ```

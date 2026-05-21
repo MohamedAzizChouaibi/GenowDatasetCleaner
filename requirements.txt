@@ -1,8 +1,11 @@
-pandas
 numpy
 opencv-python
 Pillow
-matplotlib
-scikit-learn
 torch
-clip
+send2trash
+imagehash
+clip @ git+https://github.com/openai/CLIP.git
+# Optional VLM backends — install only the families you want to use:
+#   open_clip_torch     # for openclip:* embedders
+#   transformers        # for siglip:* / dinov2:* and caption-based API embedders
+#   requests            # for any API-backed embedder (jina/voyage/qwen-vl/openai/anthropic/gemini)
