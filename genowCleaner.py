@@ -53,7 +53,11 @@ NAME_FILTER_RE = re.compile(r"(?:^|[_\-.])(det|seg)(?:[_\-.]|$)", re.IGNORECASE)
 SETTINGS_FILE = Path.home() / ".genow_cleaner_settings.json"
 APP_DIR = Path.home() / ".genow_cleaner"
 THUMB_SIZE = (180, 180)
-LOGO_PATH = Path(__file__).parent / "genow_logo.jpeg"
+def _resource_dir() -> Path:
+    # When frozen by PyInstaller, bundled data lives under sys._MEIPASS.
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+
+LOGO_PATH = _resource_dir() / "genow_logo.jpeg"
 
 COLOR_NAVY = "#1a1f3a"
 COLOR_NAVY_DEEP = "#0f1428"
