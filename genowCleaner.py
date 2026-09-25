@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""GenowDatasetCleaner — YOLOv11/v12 image dataset cleaner with VLM-based dedup.
+"""GenowDatasetCleaner — image dataset cleaner with VLM-based dedup.
 
-Supported dataset formats: YOLOv11 / YOLOv12 (Ultralytics).
-A dataset is accepted if it contains either a `data.yaml` with `train:` + `names:`/`nc:`,
-or parallel `images/` and `labels/` directories.
+Works on any folder of images. YOLOv11 / YOLOv12 (Ultralytics) datasets get
+extra handling: a folder containing a `data.yaml` with `train:` + `names:`/`nc:`,
+or parallel `images/` and `labels/` directories, is treated as YOLO, and removing
+an image also removes its companion label `.txt`. Any other folder is processed
+as a plain image collection (images only, labels untouched).
 
 Usage:
     python genowCleaner.py                 # launch GUI
@@ -12,12 +14,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
 import threading
 from collections import OrderedDict
@@ -146,18 +150,18 @@ def quality_score(m: dict) -> float:
     )
 
 
-def collect_images(dataset_path: Path) -> list[Path]:
+def collect_images(dataset_path: Path, skip_labels: bool = True) -> list[Path]:
     """Recursively collect image files without following symlinks.
 
-    Skips the YOLO `labels/` subtrees so label-adjacent .txt files don't get
-    scanned as images, and skips quarantine/report dirs.
+    With `skip_labels`, skips the YOLO `labels/` subtrees so label-adjacent
+    files don't get scanned as images. Always skips quarantine/report dirs.
     """
     out: list[Path] = []
     for root, dirs, files in os.walk(dataset_path, followlinks=False):
         dirs[:] = [d for d in dirs
                    if not d.startswith("_quarantine_")
                    and not d.startswith(".genow_cleaner")
-                   and d.lower() != "labels"]
+                   and not (skip_labels and d.lower() == "labels")]
         for f in files:
             p = Path(root) / f
             if p.suffix.lower() in IMG_EXTENSIONS:
@@ -189,6 +193,22 @@ def validate_yolo_dataset(path: Path) -> tuple[bool, str]:
                    "directories.")
 
 
+FORMAT_YOLO = "yolo"
+FORMAT_IMAGES = "images"
+FORMAT_NAMES = {FORMAT_YOLO: "YOLOv11/v12", FORMAT_IMAGES: "image folder"}
+
+
+def detect_dataset_format(path: Path) -> tuple[Optional[str], str]:
+    """Return (format, reason). format is FORMAT_YOLO for a YOLO dataset,
+    FORMAT_IMAGES for any other directory, or None if path is unusable."""
+    if not path.is_dir():
+        return None, f"Not a directory: {path}"
+    ok, reason = validate_yolo_dataset(path)
+    if ok:
+        return FORMAT_YOLO, reason
+    return FORMAT_IMAGES, "no YOLO layout found, treating as a plain image folder"
+
+
 def yolo_label_path(image_path: Path) -> Path:
     """Resolve the YOLO label file for an image.
 
@@ -203,51 +223,76 @@ def yolo_label_path(image_path: Path) -> Path:
     return image_path.with_suffix(".txt")
 
 
-class UnionFind:
-    def __init__(self, n: int) -> None:
-        self.parent = list(range(n))
+SPLIT_ALIASES = {"train": "train", "val": "val", "valid": "val",
+                 "validation": "val", "test": "test"}
+# Lower rank = kept first. Evaluation splits are small and often fixed, so a
+# duplicate that leaks across splits is removed from train, not from val/test.
+SPLIT_KEEP_RANK = {"test": 0, "val": 1, "train": 2}
 
-    def find(self, x: int) -> int:
-        while self.parent[x] != x:
-            self.parent[x] = self.parent[self.parent[x]]
-            x = self.parent[x]
-        return x
 
-    def union(self, a: int, b: int) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[ra] = rb
+def yolo_split(image_path: Path) -> Optional[str]:
+    """Return the canonical split ("train"/"val"/"test") of an image, or None.
+
+    Handles both `images/<split>/foo.jpg` (Ultralytics) and
+    `<split>/images/foo.jpg` (Roboflow export) layouts.
+    """
+    for part in reversed(image_path.parts[:-1]):
+        split = SPLIT_ALIASES.get(part.lower())
+        if split:
+            return split
+    return None
+
+
+def keep_priority(path: Path, quality: dict[Path, dict]) -> tuple[int, float]:
+    """Sort key for duplicate members: first element is the one to keep."""
+    rank = SPLIT_KEEP_RANK.get(yolo_split(path), len(SPLIT_KEEP_RANK))
+    return rank, -quality_score(quality.get(path, {}))
+
+
+def cluster_splits(members: list[Path]) -> list[str]:
+    """Distinct known splits in a cluster, in train/val/test order."""
+    found = {yolo_split(p) for p in members} - {None}
+    return [sp for sp in ("train", "val", "test") if sp in found]
 
 
 def cluster_by_similarity(embeddings: np.ndarray, threshold: float,
+                          order: Optional[list[int]] = None,
                           cancel_check: Callable[[], bool] = lambda: False,
                           progress: Optional[Callable[[int, int], None]] = None
                           ) -> list[list[int]]:
     """Cluster row-normalized embeddings by cosine similarity > threshold.
 
-    Memory is O(chunk * N), not O(N^2). Time is O(N^2 / chunk * chunk) = O(N^2).
+    Greedy leader clustering: rows are visited in `order` (best-to-keep first);
+    each still-unassigned row becomes a leader and absorbs every unassigned row
+    similar to *it*. Unlike transitive linking, this can't chain A~B~C into one
+    cluster when A and C differ, so every member is a duplicate of the leader,
+    which is returned first.
+
+    Memory is O(chunk * N), not O(N^2). Time is O(N^2).
     """
     n = embeddings.shape[0]
     if n < 2:
         return []
-    uf = UnionFind(n)
+    visit = np.arange(n) if order is None else np.asarray(order, dtype=np.int64)
+    assigned = np.zeros(n, dtype=bool)
+    clusters: list[list[int]] = []
     chunk = 512
     for s in range(0, n, chunk):
         if cancel_check():
             return []
-        e = min(n, s + chunk)
-        sim = embeddings[s:e] @ embeddings.T
-        for li, i in enumerate(range(s, e)):
-            row = sim[li, i + 1:]
-            hits = np.where(row > threshold)[0] + (i + 1)
-            for j in hits:
-                uf.union(i, int(j))
+        rows = visit[s:s + chunk]
+        sim = embeddings[rows] @ embeddings.T
+        for li, i in enumerate(rows):
+            if assigned[i]:
+                continue
+            assigned[i] = True
+            hits = np.where((sim[li] > threshold) & ~assigned)[0]
+            if hits.size:
+                assigned[hits] = True
+                clusters.append([int(i)] + hits.tolist())
         if progress:
-            progress(e, n)
-    groups: dict[int, list[int]] = {}
-    for idx in range(n):
-        groups.setdefault(uf.find(idx), []).append(idx)
-    return [m for m in groups.values() if len(m) >= 2]
+            progress(min(n, s + chunk), n)
+    return clusters
 
 
 def perceptual_hash_groups(paths: list[Path],
@@ -329,12 +374,13 @@ class AnalysisJob(threading.Thread):
             self._post("error", message=str(e))
 
     def _analyze(self) -> dict:
-        ok, reason = validate_yolo_dataset(self.dataset_path)
-        if not ok:
+        fmt, reason = detect_dataset_format(self.dataset_path)
+        if fmt is None:
             raise RuntimeError(reason)
-        self._post("log", message=f"YOLOv11/v12 dataset OK ({reason}).")
+        self._post("log", message=f"{FORMAT_NAMES[fmt]} dataset ({reason}).")
         self._post("log", message="Collecting image files…")
-        all_imgs = collect_images(self.dataset_path)
+        all_imgs = collect_images(self.dataset_path,
+                                  skip_labels=(fmt == FORMAT_YOLO))
         self._post("log", message=f"Found {len(all_imgs)} image file(s).")
 
         name_filtered: list[Path] = []
@@ -381,8 +427,7 @@ class AnalysisJob(threading.Thread):
                 exact_dupes: set[Path] = set()
                 for hash_val, members in groups.items():
                     if len(members) >= 2:
-                        members.sort(key=lambda p: quality_score(quality.get(p, {})),
-                                     reverse=True)
+                        members.sort(key=lambda p: keep_priority(p, quality))
                         phash_dupes.append(members)
                         exact_dupes.update(members[1:])
                 paths_for_clip = [p for p in clean if p not in exact_dupes]
@@ -396,6 +441,8 @@ class AnalysisJob(threading.Thread):
                 return {}
             clip_clusters_idx = cluster_by_similarity(
                 embeddings, self.config.duplicate_threshold,
+                order=sorted(range(len(valid)),
+                             key=lambda k: keep_priority(valid[k], quality)),
                 cancel_check=self.cancelled,
                 progress=lambda done, total: self._post(
                     "progress", value=90 + done / max(total, 1) * 10,
@@ -404,10 +451,15 @@ class AnalysisJob(threading.Thread):
             clip_clusters: list[list[Path]] = []
             for members in clip_clusters_idx:
                 ps = [valid[m] for m in members]
-                ps.sort(key=lambda p: quality_score(quality.get(p, {})), reverse=True)
+                ps.sort(key=lambda p: keep_priority(p, quality))
                 clip_clusters.append(ps)
             clusters = phash_dupes + clip_clusters
             clusters.sort(key=len, reverse=True)
+            n_cross = sum(1 for c in clusters if len(cluster_splits(c)) > 1)
+            if n_cross:
+                self._post("log",
+                           message=f"{n_cross} duplicate cluster(s) span several splits "
+                                   f"(train/val/test leakage); val/test copies are kept.")
 
         scores = {str(p): quality_score(m) for p, m in quality.items()}
         return {
@@ -420,6 +472,7 @@ class AnalysisJob(threading.Thread):
             "duplicate_clusters": clusters,
             "quality_scores": scores,
             "total_scanned": len(all_imgs),
+            "dataset_format": fmt,
         }
 
     def _analyze_quality(self, paths: list[Path]) -> tuple[dict[Path, dict], list[Path]]:
@@ -503,16 +556,19 @@ def _safe_move(src: Path, dst_dir: Path) -> Optional[Path]:
         return None
 
 
-def remove_yolo_pair(image_path: Path, use_trash: bool, quarantine_dir: Path
+def remove_yolo_pair(image_path: Path, use_trash: bool, quarantine_dir: Path,
+                     with_label: bool = True
                      ) -> tuple[int, list[tuple[Path, Path]]]:
-    """Remove a YOLO image and its companion label .txt.
+    """Remove an image and, if `with_label`, its companion YOLO label .txt.
 
     Returns (count_removed, undo_moves). undo_moves is populated only when files
     were moved to quarantine (system-trash deletes are not tracked for undo).
     """
     moves: list[tuple[Path, Path]] = []
     count = 0
-    targets = [image_path, yolo_label_path(image_path)]
+    targets = [image_path]
+    if with_label:
+        targets.append(yolo_label_path(image_path))
     for t in targets:
         if not t.exists():
             continue
@@ -547,14 +603,15 @@ def write_report(report_path: Path, dataset: Path, results: dict, config: Config
     for c in results.get("duplicate_clusters", []):
         scores = results.get("quality_scores", {})
         clusters_out.append([
-            {"path": str(p), "quality_score": scores.get(str(p))} for p in c
+            {"path": str(p), "split": yolo_split(p),
+             "quality_score": scores.get(str(p))} for p in c
         ])
 
     report = {
         "schema": 2,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "dataset": str(dataset),
-        "dataset_format": "YOLOv11/v12",
+        "dataset_format": FORMAT_NAMES[results.get("dataset_format", FORMAT_YOLO)],
         "config": asdict(config),
         "total_scanned": results.get("total_scanned", 0),
         "categories": {
@@ -605,8 +662,11 @@ def _run_gui() -> int:
 
     # ----- Scrollable container -----
     class ScrollableFrame(ttk.Frame):
-        def __init__(self, master, **kw):
+        def __init__(self, master, fill_height=False, **kw):
+            """With `fill_height`, the inner frame is stretched to at least the
+            visible height so expanding children still fill the window."""
             super().__init__(master, **kw)
+            self.fill_height = fill_height
             self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0, bg=COLOR_BG)
             self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
             self.canvas.configure(yscrollcommand=self.vsb.set)
@@ -616,12 +676,22 @@ def _run_gui() -> int:
             self.inner_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
             self.inner.bind("<Configure>",
                             lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-            self.canvas.bind("<Configure>",
-                             lambda e: self.canvas.itemconfigure(self.inner_id, width=e.width))
+            self.canvas.bind("<Configure>", self._on_canvas_configure)
+            if fill_height:
+                self.inner.bind("<Configure>", self._on_canvas_configure, add="+")
             self.canvas.bind("<Enter>", self._bind_wheel)
             self.canvas.bind("<Leave>", self._unbind_wheel)
 
+        def _on_canvas_configure(self, _e=None):
+            opts = {"width": self.canvas.winfo_width()}
+            if self.fill_height:
+                opts["height"] = max(self.canvas.winfo_height(),
+                                     self.inner.winfo_reqheight())
+            self.canvas.itemconfigure(self.inner_id, **opts)
+
         def _on_wheel(self, evt):
+            if isinstance(evt.widget, tk.Text):
+                return  # the Text widget scrolls itself
             if getattr(evt, "num", None) == 4:
                 delta = -1
             elif getattr(evt, "num", None) == 5:
@@ -640,196 +710,375 @@ def _run_gui() -> int:
             self.canvas.unbind_all("<Button-4>")
             self.canvas.unbind_all("<Button-5>")
 
-    # ----- Review windows -----
-    class CategoryReview(tk.Toplevel):
-        def __init__(self, master, title, items, score_label, on_delete, thumb_cache):
-            super().__init__(master)
-            self.title(f"Review — {title}")
-            self.geometry("1000x720")
-            self.configure(bg=COLOR_BG)
-            self.items = items
-            self.score_label = score_label
-            self.on_delete = on_delete
-            self.thumbs = thumb_cache
-            self.vars = []
-            self.paths = []
-            self._build(title)
+    # ----- Full-size viewer -----
+    def open_full_image(master, paths, index=0, is_marked=None, on_toggle=None):
+        """Show paths[index] fitted to the screen.
 
-        def _build(self, title):
+        Esc or a click closes, ←/→ step through `paths`, and Del toggles the
+        image's delete mark when `on_toggle(i)` is given.
+        """
+        win = tk.Toplevel(master)
+        win.configure(bg=COLOR_NAVY_DEEP)
+        win.transient(master)
+        max_w = int(win.winfo_screenwidth() * 0.85)
+        max_h = int(win.winfo_screenheight() * 0.78)
+        img_lbl = tk.Label(win, bg=COLOR_NAVY_DEEP, fg="#ffffff", cursor="hand2")
+        img_lbl.pack(padx=12, pady=(12, 6))
+        info = tk.Label(win, bg=COLOR_NAVY_DEEP, fg="#ffffff",
+                        font=("Segoe UI", 10), wraplength=max_w)
+        info.pack(padx=12)
+        hint = "Esc/click close  ·  ←/→ previous/next"
+        if on_toggle:
+            hint += "  ·  Del toggle delete"
+        tk.Label(win, text=hint, bg=COLOR_NAVY_DEEP, fg="#9aa0b4",
+                 font=("Segoe UI", 9)).pack(pady=(2, 10))
+        pos = [index]
+
+        def show():
+            path = paths[pos[0]]
+            win.title(f"{path.name} — {pos[0] + 1}/{len(paths)}")
+            try:
+                with Image.open(path) as raw:
+                    size_txt = f"{raw.width}×{raw.height}"
+                    img = raw.convert("RGB")
+                img.thumbnail((max_w, max_h))
+                photo = ImageTk.PhotoImage(img)
+                img_lbl.configure(image=photo, text="")
+                img_lbl.image = photo
+            except (OSError, ValueError):
+                img_lbl.configure(image="", text="(unreadable)")
+                img_lbl.image = None
+                size_txt = "unreadable"
+            text = f"{path}   ·   {size_txt}"
+            if is_marked and is_marked(pos[0]):
+                text += "   ·   MARKED FOR DELETION"
+            info.configure(text=text)
+
+        def step(delta):
+            pos[0] = (pos[0] + delta) % len(paths)
+            show()
+
+        def toggle():
+            on_toggle(pos[0])
+            show()
+
+        win.bind("<Escape>", lambda _e: win.destroy())
+        img_lbl.bind("<Button-1>", lambda _e: win.destroy())
+        win.bind("<Left>", lambda _e: step(-1))
+        win.bind("<Right>", lambda _e: step(1))
+        if on_toggle:
+            win.bind("<Delete>", lambda _e: toggle())
+        show()
+        win.focus_set()
+        return win
+
+    # ----- Review windows -----
+    class PagedReview(tk.Toplevel):
+        """Paginated review window with shared keyboard shortcuts.
+
+        Esc close, ←/→ page, Del delete, Ctrl+A / Ctrl+D select all / none.
+        Subclasses implement _render_page, _set_all and _confirm.
+        """
+        page_size = 50
+
+        def __init__(self, master, n_units, geometry, title, subtitle, thumb_cache):
+            super().__init__(master)
+            self.geometry(geometry)
+            self.configure(bg=COLOR_BG)
+            self.thumbs = thumb_cache
+            self.page = 0
+            self.n_pages = max(1, -(-n_units // self.page_size))
+
             hdr = ttk.Frame(self, padding=12)
             hdr.pack(fill="x")
             ttk.Label(hdr, text=title, style="Header.TLabel").pack(side="left")
-            ttk.Label(hdr, text=f"   {len(self.items)} item(s)",
+            ttk.Label(hdr, text=f"   {subtitle}", style="Sub.TLabel").pack(side="left")
+
+            self.toolbar = ttk.Frame(self, padding=(12, 0))
+            self.toolbar.pack(fill="x")
+            pager = ttk.Frame(self.toolbar)
+            pager.pack(side="right")
+            self.prev_btn = ttk.Button(pager, text="◀ Prev",
+                                       command=lambda: self._goto(self.page - 1))
+            self.prev_btn.pack(side="left")
+            self.page_lbl = ttk.Label(pager, style="Sub.TLabel")
+            self.page_lbl.pack(side="left", padx=8)
+            self.next_btn = ttk.Button(pager, text="Next ▶",
+                                       command=lambda: self._goto(self.page + 1))
+            self.next_btn.pack(side="left")
+
+            self.body = ScrollableFrame(self)
+            self.body.pack(fill="both", expand=True, padx=12, pady=10)
+
+            self.footer = ttk.Frame(self, padding=12)
+            self.footer.pack(fill="x")
+            ttk.Label(self.footer,
+                      text="Esc close · ←/→ page · Del delete · Ctrl+A / Ctrl+D "
+                           "select all / none · click a thumbnail to zoom",
                       style="Sub.TLabel").pack(side="left")
 
-            toolbar = ttk.Frame(self, padding=(12, 0))
-            toolbar.pack(fill="x")
-            ttk.Button(toolbar, text="Select All",
+            self.bind("<Escape>", lambda _e: self.destroy())
+            self.bind("<Left>", lambda _e: self._goto(self.page - 1))
+            self.bind("<Right>", lambda _e: self._goto(self.page + 1))
+            self.bind("<Delete>", lambda _e: self._confirm())
+            for seq in ("<Control-a>", "<Control-A>"):
+                self.bind(seq, lambda _e: self._set_all(True) or "break")
+            for seq in ("<Control-d>", "<Control-D>"):
+                self.bind(seq, lambda _e: self._set_all(False) or "break")
+            self.focus_set()
+
+        def _goto(self, page):
+            if not 0 <= page < self.n_pages:
+                return
+            self.page = page
+            for w in self.body.inner.winfo_children():
+                w.destroy()
+            self._render_page()
+            self.body.canvas.yview_moveto(0)
+            self.page_lbl.config(text=f"Page {page + 1}/{self.n_pages}")
+            self.prev_btn.state(["!disabled" if page > 0 else "disabled"])
+            self.next_btn.state(["!disabled" if page < self.n_pages - 1 else "disabled"])
+
+        def _page_range(self, n):
+            start = self.page * self.page_size
+            return range(start, min(n, start + self.page_size))
+
+        def _thumb(self, parent, path, on_click):
+            photo = self.thumbs.get(path)
+            if photo:
+                lbl = ttk.Label(parent, image=photo, style="Card.TLabel", cursor="hand2")
+                lbl.image = photo
+                lbl.bind("<Button-1>", lambda _e: on_click())
+            else:
+                lbl = ttk.Label(parent, text="(unreadable)", style="Card.TLabel")
+            return lbl
+
+        def _render_page(self):
+            raise NotImplementedError
+
+        def _set_all(self, val):
+            raise NotImplementedError
+
+        def _confirm(self):
+            raise NotImplementedError
+
+    class CategoryReview(PagedReview):
+        page_size = 50
+        cols = 5
+
+        def __init__(self, master, title, items, score_label, on_delete, thumb_cache):
+            super().__init__(master, len(items), "1000x760", title,
+                             f"{len(items)} item(s)", thumb_cache)
+            self.title(f"Review — {title}")
+            self.items = items
+            self.paths = [it[0] if isinstance(it, tuple) else it for it in items]
+            self.score_label = score_label
+            self.on_delete = on_delete
+            self.selected = [False] * len(items)
+            self.page_vars: dict[int, tk.BooleanVar] = {}
+
+            ttk.Button(self.toolbar, text="Select All",
                        command=lambda: self._set_all(True)).pack(side="left", padx=2)
-            ttk.Button(toolbar, text="Select None",
+            ttk.Button(self.toolbar, text="Select None",
                        command=lambda: self._set_all(False)).pack(side="left", padx=2)
-            self.summary_lbl = ttk.Label(toolbar, text="", style="Sub.TLabel")
+            self.summary_lbl = ttk.Label(self.toolbar, text="", style="Sub.TLabel")
             self.summary_lbl.pack(side="left", padx=12)
 
-            body = ScrollableFrame(self)
-            body.pack(fill="both", expand=True, padx=12, pady=10)
-            grid = body.inner
-            cols = 5
-            for i, item in enumerate(self.items):
-                if isinstance(item, tuple):
-                    path, score = item
-                    caption = f"{self.score_label}: {score:.2f}"
-                else:
-                    path, caption = item, ""
-                self.paths.append(path)
-                var = tk.BooleanVar(value=True)
-                var.trace_add("write", lambda *_: self._update_summary())
-                self.vars.append(var)
+            ttk.Button(self.footer, text="Close", command=self.destroy).pack(side="right", padx=4)
+            ttk.Button(self.footer, text="Delete Selected", style="Danger.TButton",
+                       command=self._confirm).pack(side="right", padx=4)
+            self._update_summary()
+            self._goto(0)
 
+        def _render_page(self):
+            grid = self.body.inner
+            self.page_vars.clear()
+            for slot, i in enumerate(self._page_range(len(self.items))):
+                item, path = self.items[i], self.paths[i]
+                caption = (f"{self.score_label}: {item[1]:.2f}"
+                           if isinstance(item, tuple) else "")
                 card = ttk.Frame(grid, style="Card.TFrame", padding=6)
-                card.grid(row=i // cols, column=i % cols, padx=6, pady=6, sticky="nsew")
-                grid.columnconfigure(i % cols, weight=1)
-
-                photo = self.thumbs.get(path)
-                if photo:
-                    lbl = ttk.Label(card, image=photo, style="Card.TLabel")
-                    lbl.image = photo
-                else:
-                    lbl = ttk.Label(card, text="(unreadable)", style="Card.TLabel")
-                lbl.pack()
+                card.grid(row=slot // self.cols, column=slot % self.cols,
+                          padx=6, pady=6, sticky="nsew")
+                grid.columnconfigure(slot % self.cols, weight=1)
+                self._thumb(card, path, lambda i=i: self._zoom(i)).pack()
                 ttk.Label(card, text=path.name, style="Card.TLabel",
                           wraplength=170).pack(pady=(4, 0))
                 if caption:
                     ttk.Label(card, text=caption, style="Card.TLabel",
                               foreground=COLOR_TEXT_MUTED).pack()
-                ttk.Checkbutton(card, text="Delete", variable=var).pack(pady=(4, 0))
+                var = tk.BooleanVar(value=self.selected[i])
+                ttk.Checkbutton(card, text="Delete", variable=var,
+                                command=lambda i=i, v=var: self._mark(i, v.get())
+                                ).pack(pady=(4, 0))
+                self.page_vars[i] = var
 
-            footer = ttk.Frame(self, padding=12)
-            footer.pack(fill="x")
-            ttk.Button(footer, text="Close", command=self.destroy).pack(side="right", padx=4)
-            ttk.Button(footer, text="Delete Selected", style="Danger.TButton",
-                       command=self._confirm).pack(side="right", padx=4)
+        def _zoom(self, i):
+            open_full_image(self, self.paths, i,
+                            is_marked=lambda k: self.selected[k],
+                            on_toggle=lambda k: self._mark(k, not self.selected[k]))
+
+        def _mark(self, i, val):
+            self.selected[i] = val
+            var = self.page_vars.get(i)
+            if var is not None and var.get() != val:
+                var.set(val)
             self._update_summary()
 
         def _set_all(self, val):
-            for v in self.vars:
-                v.set(val)
+            self.selected = [val] * len(self.items)
+            for var in self.page_vars.values():
+                var.set(val)
+            self._update_summary()
 
         def _update_summary(self):
-            n = sum(1 for v in self.vars if v.get())
-            self.summary_lbl.config(text=f"{n}/{len(self.vars)} selected for deletion")
+            self.summary_lbl.config(
+                text=f"{sum(self.selected)}/{len(self.selected)} selected for deletion")
 
         def _confirm(self):
-            to_delete = [self.paths[i] for i, v in enumerate(self.vars) if v.get()]
+            to_delete = [p for p, sel in zip(self.paths, self.selected) if sel]
             if not to_delete:
-                messagebox.showinfo("Nothing selected", "No items selected.")
+                messagebox.showinfo("Nothing selected", "No items selected.", parent=self)
                 return
             if not messagebox.askyesno(
                     "Confirm deletion",
                     f"Remove {len(to_delete)} item(s)?\n"
-                    f"Companion label files (xml/txt/json) will be removed as well."):
+                    f"For YOLO datasets, companion label files (.txt) are removed as well.",
+                    parent=self):
                 return
             deleted = self.on_delete(to_delete)
-            messagebox.showinfo("Done", f"{deleted} file(s) removed.")
+            messagebox.showinfo("Done", f"{deleted} file(s) removed.", parent=self)
             self.destroy()
 
-    class DuplicateReview(tk.Toplevel):
+    class DuplicateReview(PagedReview):
+        page_size = 15
+        cols = 6
+
         def __init__(self, master, clusters, quality_scores, on_delete,
                      on_auto_clean, thumb_cache):
-            super().__init__(master)
+            total_dupes = sum(len(c) - 1 for c in clusters)
+            super().__init__(master, len(clusters), "1120x820", "Duplicate clusters",
+                             f"{len(clusters)} cluster(s) · {total_dupes} duplicate(s)",
+                             thumb_cache)
             self.title("Review — Duplicate clusters")
-            self.geometry("1120x800")
-            self.configure(bg=COLOR_BG)
             self.clusters = clusters
             self.scores = quality_scores
             self.on_delete = on_delete
             self.on_auto_clean = on_auto_clean
-            self.thumbs = thumb_cache
-            self.keep_vars = []
-            self.skip_vars = []
-            self._build()
+            # Indices kept in each cluster; several may be kept, never none.
+            self.keep: list[set[int]] = [{0} for _ in clusters]
+            self.skip = [False] * len(clusters)
+            self.skip_vars: dict[int, tk.BooleanVar] = {}
 
-        def _build(self):
-            hdr = ttk.Frame(self, padding=12)
-            hdr.pack(fill="x")
-            ttk.Label(hdr, text="Duplicate clusters", style="Header.TLabel").pack(side="left")
-            total_dupes = sum(len(c) - 1 for c in self.clusters)
-            ttk.Label(hdr, text=f"   {len(self.clusters)} cluster(s) · {total_dupes} duplicate(s)",
-                      style="Sub.TLabel").pack(side="left")
+            ttk.Button(self.toolbar, text="Include All",
+                       command=lambda: self._set_all(True)).pack(side="left", padx=2)
+            ttk.Button(self.toolbar, text="Skip All",
+                       command=lambda: self._set_all(False)).pack(side="left", padx=2)
+            self.summary_lbl = ttk.Label(self.toolbar, text="", style="Sub.TLabel")
+            self.summary_lbl.pack(side="left", padx=12)
 
-            body = ScrollableFrame(self)
-            body.pack(fill="both", expand=True, padx=12, pady=10)
-            container = body.inner
+            ttk.Button(self.footer, text="Close", command=self.destroy).pack(side="right", padx=4)
+            ttk.Button(self.footer, text="Delete Non-Kept", style="Danger.TButton",
+                       command=self._confirm).pack(side="right", padx=4)
+            ttk.Button(self.footer, text="Auto-clean (keep best in each)",
+                       style="Accent.TButton",
+                       command=self._auto_clean).pack(side="right", padx=4)
+            self._update_summary()
+            self._goto(0)
 
-            for ci, members in enumerate(self.clusters):
-                keep_var = tk.IntVar(value=0)
-                skip_var = tk.BooleanVar(value=False)
-                self.keep_vars.append(keep_var)
-                self.skip_vars.append(skip_var)
-
+        def _render_page(self):
+            container = self.body.inner
+            self.skip_vars.clear()
+            for ci in self._page_range(len(self.clusters)):
+                members = self.clusters[ci]
                 box = ttk.Frame(container, style="Card.TFrame", padding=10)
                 box.pack(fill="x", padx=4, pady=6)
 
                 head = ttk.Frame(box, style="Card.TFrame")
                 head.pack(fill="x")
-                ttk.Label(head, text=f"Cluster {ci + 1} — {len(members)} images",
+                title = f"Cluster {ci + 1} — {len(members)} images"
+                splits = cluster_splits(members)
+                if len(splits) > 1:
+                    title += f"  ·  spans {'/'.join(splits)}"
+                ttk.Label(head, text=title,
                           style="CardTitle.TLabel").pack(side="left")
+                skip_var = tk.BooleanVar(value=self.skip[ci])
                 ttk.Checkbutton(head, text="Skip this cluster (keep all)",
-                                variable=skip_var).pack(side="right")
+                                variable=skip_var,
+                                command=lambda ci=ci, v=skip_var: self._set_skip(ci, v.get())
+                                ).pack(side="right")
+                self.skip_vars[ci] = skip_var
 
-                row = ttk.Frame(box, style="Card.TFrame")
-                row.pack(fill="x", pady=(8, 0))
+                grid = ttk.Frame(box, style="Card.TFrame")
+                grid.pack(fill="x", pady=(8, 0))
                 for mi, path in enumerate(members):
-                    card = ttk.Frame(row, style="Card.TFrame", padding=4)
-                    card.pack(side="left", padx=4)
-                    photo = self.thumbs.get(path)
-                    if photo:
-                        lbl = ttk.Label(card, image=photo, style="Card.TLabel")
-                        lbl.image = photo
-                    else:
-                        lbl = ttk.Label(card, text="(unreadable)", style="Card.TLabel")
-                    lbl.pack()
-                    ttk.Label(card, text=path.name, style="Card.TLabel",
-                              wraplength=170).pack()
+                    card = ttk.Frame(grid, style="Card.TFrame", padding=4)
+                    card.grid(row=mi // self.cols, column=mi % self.cols, padx=4, pady=4)
+                    self._thumb(card, path,
+                                lambda m=members, mi=mi: open_full_image(self, m, mi)).pack()
+                    split = yolo_split(path)
+                    ttk.Label(card, text=f"{path.name} ({split})" if split else path.name,
+                              style="Card.TLabel", wraplength=170).pack()
                     score = self.scores.get(str(path))
-                    score_txt = f"q={score:.2f}" if score is not None else ""
-                    if score_txt:
-                        ttk.Label(card, text=score_txt, style="Card.TLabel",
+                    if score is not None:
+                        ttk.Label(card, text=f"q={score:.2f}", style="Card.TLabel",
                                   foreground=COLOR_TEXT_MUTED).pack()
-                    ttk.Radiobutton(card, text="Keep this", variable=keep_var,
-                                    value=mi).pack()
+                    keep_var = tk.BooleanVar(value=mi in self.keep[ci])
+                    ttk.Checkbutton(card, text="Keep this", variable=keep_var,
+                                    command=lambda ci=ci, mi=mi, v=keep_var:
+                                        self._set_keep(ci, mi, v)
+                                    ).pack()
 
-            footer = ttk.Frame(self, padding=12)
-            footer.pack(fill="x")
-            ttk.Button(footer, text="Close", command=self.destroy).pack(side="right", padx=4)
-            ttk.Button(footer, text="Delete Non-Kept", style="Danger.TButton",
-                       command=self._confirm).pack(side="right", padx=4)
-            ttk.Button(footer, text="Auto-clean (keep best in each)",
-                       style="Accent.TButton",
-                       command=self._auto_clean).pack(side="left", padx=4)
+        def _set_keep(self, ci, mi, var):
+            if var.get():
+                self.keep[ci].add(mi)
+            elif self.keep[ci] == {mi}:
+                var.set(True)  # at least one image per cluster must be kept
+                messagebox.showinfo(
+                    "Keep at least one",
+                    "Each cluster must keep at least one image.\n"
+                    "Use \"Skip this cluster\" to keep them all.", parent=self)
+                return
+            else:
+                self.keep[ci].discard(mi)
+            self._update_summary()
+
+        def _set_skip(self, ci, val):
+            self.skip[ci] = val
+            self._update_summary()
+
+        def _set_all(self, include):
+            self.skip = [not include] * len(self.clusters)
+            for var in self.skip_vars.values():
+                var.set(not include)
+            self._update_summary()
+
+        def _to_delete(self):
+            return [p for ci, members in enumerate(self.clusters) if not self.skip[ci]
+                    for mi, p in enumerate(members) if mi not in self.keep[ci]]
+
+        def _update_summary(self):
+            included = self.skip.count(False)
+            self.summary_lbl.config(
+                text=f"{included}/{len(self.clusters)} cluster(s) included · "
+                     f"{len(self._to_delete())} file(s) to delete")
 
         def _auto_clean(self):
             self.destroy()
             self.on_auto_clean()
 
         def _confirm(self):
-            to_delete = []
-            for ci, members in enumerate(self.clusters):
-                if self.skip_vars[ci].get():
-                    continue
-                keep = self.keep_vars[ci].get()
-                for mi, p in enumerate(members):
-                    if mi != keep:
-                        to_delete.append(p)
+            to_delete = self._to_delete()
             if not to_delete:
-                messagebox.showinfo("Nothing to delete", "All clusters skipped.")
+                messagebox.showinfo("Nothing to delete", "All clusters skipped.", parent=self)
                 return
             if not messagebox.askyesno("Confirm deletion",
                                        f"Remove {len(to_delete)} duplicate(s)?\n"
-                                       f"Companion label files will be removed as well."):
+                                       f"For YOLO datasets, companion label files are removed as well.",
+                                       parent=self):
                 return
             deleted = self.on_delete(to_delete)
-            messagebox.showinfo("Done", f"{deleted} file(s) removed.")
+            messagebox.showinfo("Done", f"{deleted} file(s) removed.", parent=self)
             self.destroy()
 
     CATEGORY_META = [
@@ -860,11 +1109,12 @@ def _run_gui() -> int:
             self.embedder = None
             self._quarantine_dir: Optional[Path] = None
             self._undo_stack: list[list[tuple[Path, Path]]] = []
+            self._embedder_loading = False
             self._setup_style()
             self._setup_window()
             self._build_ui()
             self._poll()
-            threading.Thread(target=self._load_embedder, daemon=True).start()
+            self._reload_embedder(self.config.embedder)
 
         def _setup_style(self):
             style = ttk.Style()
@@ -948,7 +1198,7 @@ def _run_gui() -> int:
         def _setup_window(self):
             self.root.title("Genow Dataset Cleaner")
             self.root.geometry("1080x880")
-            self.root.minsize(900, 720)
+            self.root.minsize(900, 480)
             self.root.protocol("WM_DELETE_WINDOW", self._on_close)
             self._logo_header = None
             self._logo_icon = None
@@ -993,7 +1243,13 @@ def _run_gui() -> int:
                      bg=COLOR_BG, fg=COLOR_TEXT_MUTED,
                      font=("Segoe UI", 9)).pack(side="right")
 
-            title_wrap = ttk.Frame(self.root, padding=(24, 18, 24, 4))
+            # Everything below the brand bar scrolls, so the activity log stays
+            # reachable when the window is shorter than the content.
+            self.page = ScrollableFrame(self.root, fill_height=True)
+            self.page.pack(fill="both", expand=True)
+            self.body = self.page.inner
+
+            title_wrap = ttk.Frame(self.body, padding=(24, 18, 24, 4))
             title_wrap.pack(fill="x")
             ttk.Label(title_wrap, text="Dataset Cleaner", style="H1.TLabel").pack(anchor="w")
             ttk.Label(title_wrap,
@@ -1001,7 +1257,7 @@ def _run_gui() -> int:
                            "low-information frames, and CLIP-based duplicates.",
                       style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
 
-            pathf = ttk.Frame(self.root, padding=(24, 12, 24, 4))
+            pathf = ttk.Frame(self.body, padding=(24, 12, 24, 4))
             pathf.pack(fill="x")
             ttk.Label(pathf, text="Dataset folder", style="H2.TLabel").pack(anchor="w")
             row = ttk.Frame(pathf)
@@ -1012,7 +1268,7 @@ def _run_gui() -> int:
 
             self._build_settings()
 
-            actions = ttk.Frame(self.root, padding=(24, 10, 24, 4))
+            actions = ttk.Frame(self.body, padding=(24, 10, 24, 4))
             actions.pack(fill="x")
             self.analyze_btn = ttk.Button(actions, text="Analyze dataset",
                                           style="Accent.TButton",
@@ -1024,24 +1280,31 @@ def _run_gui() -> int:
             self.undo_btn = ttk.Button(actions, text="Undo last delete",
                                        command=self._on_undo, state="disabled")
             self.undo_btn.pack(side="left", padx=(8, 0))
+            self.clean_all_btn = ttk.Button(actions, text="Clean all problems",
+                                            style="Danger.TButton",
+                                            command=self._clean_all_problems,
+                                            state="disabled")
+            self.clean_all_btn.pack(side="left", padx=(8, 0))
+            ttk.Button(actions, text="Open reports",
+                       command=self._open_reports).pack(side="right")
             self.status_lbl = ttk.Label(actions, text="Loading embedder…",
                                         style="Sub.TLabel")
             self.status_lbl.pack(side="left", padx=14)
 
-            self.progress = ttk.Progressbar(self.root, mode="determinate", maximum=100)
+            self.progress = ttk.Progressbar(self.body, mode="determinate", maximum=100)
             self.progress.pack(fill="x", padx=24, pady=(4, 8))
 
-            self.results_frame = ttk.Frame(self.root, padding=(20, 4, 20, 4))
+            self.results_frame = ttk.Frame(self.body, padding=(20, 4, 20, 4))
             self.results_frame.pack(fill="x")
             self._render_result_cards(empty=True)
 
-            logf = ttk.Frame(self.root, padding=(24, 8, 24, 16))
+            logf = ttk.Frame(self.body, padding=(24, 8, 24, 16))
             logf.pack(fill="both", expand=True)
             ttk.Label(logf, text="Activity log", style="H2.TLabel").pack(anchor="w")
             log_box = tk.Frame(logf, bg=COLOR_BORDER, bd=0, highlightthickness=1,
                                highlightbackground=COLOR_BORDER)
             log_box.pack(fill="both", expand=True, pady=(6, 0))
-            self.log = tk.Text(log_box, height=8, wrap="word",
+            self.log = tk.Text(log_box, height=10, wrap="word",
                                bg=COLOR_SURFACE, fg=COLOR_TEXT,
                                relief="flat", borderwidth=0,
                                padx=10, pady=8,
@@ -1052,7 +1315,7 @@ def _run_gui() -> int:
             self.log.configure(yscrollcommand=sb.set, state="disabled")
 
         def _build_settings(self):
-            wrap = ttk.Frame(self.root, padding=(24, 8, 24, 4))
+            wrap = ttk.Frame(self.body, padding=(24, 8, 24, 4))
             wrap.pack(fill="x")
 
             row1 = ttk.Frame(wrap)
@@ -1121,19 +1384,23 @@ def _run_gui() -> int:
                 embedder_labels[0],
             )
             self.embedder_label_var = tk.StringVar(value=current_label)
-            emb_combo = ttk.Combobox(row3, textvariable=self.embedder_label_var,
-                                     values=embedder_labels, width=42, state="readonly")
-            emb_combo.pack(side="left", padx=(0, 12))
+            self.embedder_combo = ttk.Combobox(row3, textvariable=self.embedder_label_var,
+                                               values=embedder_labels, width=42,
+                                               state="readonly")
+            self.embedder_combo.pack(side="left", padx=(0, 12))
 
             def _commit_embedder(*_):
                 sel = self.embedder_label_var.get()
                 idx = embedder_labels.index(sel) if sel in embedder_labels else 0
-                self.config.embedder = embedder_keys[idx]
+                key = embedder_keys[idx]
+                if key == self.config.embedder and self.embedder is not None:
+                    return
+                previous = self.config.embedder if self.embedder is not None else None
+                self.config.embedder = key
                 self.config.save()
-                self.status_lbl.config(
-                    text="Embedder change applies on next launch.")
+                self._reload_embedder(key, revert_to=previous)
 
-            emb_combo.bind("<<ComboboxSelected>>", _commit_embedder)
+            self.embedder_combo.bind("<<ComboboxSelected>>", _commit_embedder)
 
             ttk.Button(row3, text="API Keys…",
                        command=self._open_api_keys).pack(side="left", padx=(0, 12))
@@ -1199,6 +1466,8 @@ def _run_gui() -> int:
                                command=self._auto_clean_duplicates,
                                state=("normal" if active else "disabled")
                                ).pack(side="left", padx=(6, 0))
+            any_problem = not empty and any(self._count(k) for k, _, _ in CATEGORY_META)
+            self.clean_all_btn.state(["!disabled" if any_problem else "disabled"])
 
         def _count(self, key):
             if not self.results:
@@ -1219,12 +1488,65 @@ def _run_gui() -> int:
                 return
             if not messagebox.askyesno(
                     "Auto-clean duplicates",
-                    f"Keep the highest-quality image in each of {len(clusters)} cluster(s) "
+                    f"Keep one image in each of {len(clusters)} cluster(s) "
                     f"and remove {len(to_delete)} duplicate(s)?\n\n"
-                    f"Quality = sharpness + info + resolution − brightness extremes.\n"
+                    f"Copies in test/val are kept over train; otherwise the "
+                    f"highest-quality one\n"
+                    f"(sharpness + info + resolution − brightness extremes).\n"
                     f"Companion label files will be removed as well."):
                 return
             self._delete_paths(to_delete)
+
+        def _clean_all_problems(self):
+            """Remove every flagged image plus all but one copy per duplicate cluster."""
+            if not self.results or (self.job and self.job.is_alive()):
+                return
+            flagged: dict[Path, None] = {}  # insertion-ordered set
+            lines = []
+            for key, label, _ in CATEGORY_META:
+                if key == "duplicates":
+                    continue
+                paths = [it[0] if isinstance(it, tuple) else it
+                         for it in self.results.get(key, [])]
+                if paths:
+                    lines.append(f"  • {label}: {len(paths)}")
+                flagged.update(dict.fromkeys(paths))
+            n_dupes = 0
+            for members in self.results.get("duplicate_clusters", []):
+                # Keep the preferred copy among those not already flagged for quality.
+                extra = [p for p in members if p not in flagged][1:]
+                n_dupes += len(extra)
+                flagged.update(dict.fromkeys(extra))
+            if n_dupes:
+                lines.append(f"  • Duplicates (all but one per cluster): {n_dupes}")
+            if not flagged:
+                messagebox.showinfo("Clean all problems", "Nothing to clean.")
+                return
+            target = ("the system trash" if self.trash_var.get() and HAS_SEND2TRASH
+                      else "a quarantine folder (undoable)")
+            labels_note = (" and their YOLO labels"
+                           if self.results.get("dataset_format") == FORMAT_YOLO else "")
+            if not messagebox.askyesno(
+                    "Clean all problems",
+                    f"Remove {len(flagged)} image(s){labels_note} to {target}?\n\n"
+                    + "\n".join(lines) +
+                    "\n\nImages flagged in several categories are counted once. In each "
+                    "duplicate cluster, the first copy not already flagged is kept."):
+                return
+            self._delete_paths(list(flagged))
+
+        def _open_reports(self):
+            report_dir = APP_DIR / "reports"
+            try:
+                report_dir.mkdir(parents=True, exist_ok=True)
+                if sys.platform.startswith("win"):
+                    os.startfile(report_dir)  # type: ignore[attr-defined]
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", str(report_dir)])
+                else:
+                    subprocess.Popen(["xdg-open", str(report_dir)])
+            except OSError as e:
+                messagebox.showerror("Open reports", f"Could not open {report_dir}:\n{e}")
 
         def _open_review(self, key):
             if key == "duplicates":
@@ -1253,10 +1575,11 @@ def _run_gui() -> int:
         def _delete_paths(self, paths):
             use_trash = bool(self.trash_var.get() and HAS_SEND2TRASH)
             quarantine = self._ensure_quarantine()
+            with_label = self.results.get("dataset_format") == FORMAT_YOLO
             total = 0
             batch_moves: list[tuple[Path, Path]] = []
             for p in paths:
-                count, moves = remove_yolo_pair(p, use_trash, quarantine)
+                count, moves = remove_yolo_pair(p, use_trash, quarantine, with_label)
                 total += count
                 batch_moves.extend(moves)
             if batch_moves:
@@ -1343,8 +1666,11 @@ def _run_gui() -> int:
             def _save():
                 for family, var in entries.items():
                     KeyStore.set(family, var.get().strip())
-                messagebox.showinfo("Saved", "API keys saved.")
+                messagebox.showinfo("Saved", "API keys saved.", parent=win)
                 win.destroy()
+                # Retry a load that failed for lack of a key.
+                if self.embedder is None and not self._embedder_loading:
+                    self._reload_embedder(self.config.embedder)
 
             footer = ttk.Frame(win, padding=12)
             footer.pack(fill="x")
@@ -1358,8 +1684,8 @@ def _run_gui() -> int:
             if not path or not path.is_dir():
                 messagebox.showerror("Invalid path", "Please choose a valid dataset folder.")
                 return
-            ok, reason = validate_yolo_dataset(path)
-            if not ok:
+            fmt, reason = detect_dataset_format(path)
+            if fmt is None:
                 messagebox.showerror("Unsupported dataset", reason)
                 return
             if self.embedder is None:
@@ -1372,8 +1698,7 @@ def _run_gui() -> int:
             self._render_result_cards(empty=True)
             self.progress["value"] = 0
             self.status_lbl.config(text="Analyzing…")
-            self.analyze_btn.state(["disabled"])
-            self.cancel_btn.state(["!disabled"])
+            self._set_running(True)
             self._append_log(f"Starting analysis: {path} ({reason})")
             self.job = AnalysisJob(path, self.config, self.event_q, self.embedder)
             self.job.start()
@@ -1434,37 +1759,76 @@ def _run_gui() -> int:
                     self._append_log(f"Report saved: {report_path}")
                 except OSError as e:
                     self._append_log(f"Report save failed: {e}")
-                self.analyze_btn.state(["!disabled"])
-                self.cancel_btn.state(["disabled"])
+                self._set_running(False)
             elif evt.kind == "cancelled":
                 self.status_lbl.config(text="Cancelled.")
                 self._append_log("Analysis cancelled.")
                 self.progress["value"] = 0
-                self.analyze_btn.state(["!disabled"])
-                self.cancel_btn.state(["disabled"])
+                self._set_running(False)
             elif evt.kind == "error":
                 self.status_lbl.config(text="Error.")
                 self._append_log(f"ERROR: {evt.message}")
                 messagebox.showerror("Analysis error", evt.message)
-                self.analyze_btn.state(["!disabled"])
-                self.cancel_btn.state(["disabled"])
+                self._set_running(False)
             elif evt.kind == "embedder_ready":
+                self._embedder_loading = False
                 self.embedder = evt.payload
                 spec = self.embedder.spec
                 self.status_lbl.config(
                     text=f"Ready. {spec.label} loaded on {device.upper()}.")
-                self.analyze_btn.state(["!disabled"])
+                self._append_log(f"Embedder ready: {spec.label}")
+                self._set_running(False)
             elif evt.kind == "embedder_error":
-                self.status_lbl.config(text="Embedder load failed.")
+                self._embedder_loading = False
+                self._set_running(False)
                 self._append_log(f"Embedder load failed: {evt.message}")
                 messagebox.showerror("Embedder error", evt.message)
+                revert_to = evt.payload
+                if revert_to and revert_to != self.config.embedder:
+                    self.config.embedder = revert_to
+                    self.config.save()
+                    self.embedder_label_var.set(get_spec(revert_to).label)
+                    self._append_log(f"Reverting to {get_spec(revert_to).label}.")
+                    self._reload_embedder(revert_to)
+                else:
+                    self.status_lbl.config(
+                        text="Embedder load failed — pick another one or set API keys.")
 
-        def _load_embedder(self):
-            try:
-                emb = load_embedder(self.config.embedder, device)
-                self.event_q.put(Event(kind="embedder_ready", payload=emb))
-            except Exception as e:
-                self.event_q.put(Event(kind="embedder_error", message=str(e)))
+        def _set_running(self, running: bool):
+            """Enable/disable controls for analysis runs and embedder loads."""
+            busy = running or self._embedder_loading
+            ready = not busy and self.embedder is not None
+            self.analyze_btn.state(["!disabled" if ready else "disabled"])
+            self.cancel_btn.state(["!disabled" if running else "disabled"])
+            self.embedder_combo.state(["disabled" if busy else "!disabled"])
+
+        def _reload_embedder(self, key: str, revert_to: Optional[str] = None):
+            """Load embedder `key` on a background thread.
+
+            The previous model is released first so two large models never
+            share GPU memory. If loading fails and `revert_to` is given, the
+            event handler switches back to that key.
+            """
+            self._embedder_loading = True
+            self.embedder = None
+            self.job = None  # a finished job still references the old model
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            self._set_running(False)
+            label = get_spec(key).label
+            self.status_lbl.config(text=f"Loading {label} on {device.upper()}…")
+            self._append_log(f"Loading embedder {label}…")
+
+            def work():
+                try:
+                    emb = load_embedder(key, device)
+                    self.event_q.put(Event(kind="embedder_ready", payload=emb))
+                except Exception as e:
+                    self.event_q.put(Event(kind="embedder_error", message=str(e),
+                                           payload=revert_to))
+
+            threading.Thread(target=work, daemon=True).start()
 
     root = tk.Tk()
     App(root)
@@ -1481,7 +1845,8 @@ def _cli_main(argv: list[str]) -> int:
     p.add_argument("--report", type=Path, default=None,
                    help="Where to write JSON report (default: ~/.genow_cleaner/reports/)")
     p.add_argument("--auto-clean-duplicates", action="store_true",
-                   help="Keep best-quality image per cluster, remove others")
+                   help="Keep one image per cluster (val/test copies first, "
+                        "then best quality), remove others")
     p.add_argument("--blur-threshold", type=float)
     p.add_argument("--dark-threshold", type=float)
     p.add_argument("--bright-threshold", type=float)
@@ -1497,11 +1862,11 @@ def _cli_main(argv: list[str]) -> int:
                    help="Use system trash (if available) instead of quarantine")
     args = p.parse_args(argv)
 
-    ok, reason = validate_yolo_dataset(args.dataset)
-    if not ok:
+    fmt, reason = detect_dataset_format(args.dataset)
+    if fmt is None:
         print(reason, file=sys.stderr)
         return 2
-    print(f"YOLOv11/v12 dataset OK ({reason}).")
+    print(f"{FORMAT_NAMES[fmt]} dataset ({reason}).")
 
     config = Config.load()
     for attr in ("blur_threshold", "dark_threshold", "bright_threshold",
@@ -1583,7 +1948,8 @@ def _cli_main(argv: list[str]) -> int:
                           f"{args.dataset.name}_{datetime.now():%Y%m%d_%H%M%S}")
             total = 0
             for path in to_delete:
-                count, _ = remove_yolo_pair(path, use_trash, quarantine)
+                count, _ = remove_yolo_pair(path, use_trash, quarantine,
+                                            with_label=(fmt == FORMAT_YOLO))
                 total += count
             target = "system trash" if use_trash else f"quarantine: {quarantine}"
             print(f"Auto-cleaned {total} file(s) → {target}")

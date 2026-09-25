@@ -1,11 +1,13 @@
-numpy
-opencv-python
-Pillow
-torch
-send2trash
-imagehash
-clip @ git+https://github.com/openai/CLIP.git
+# Upper bounds cap the next major release so an untested breaking change
+# can't slip into a fresh install or a PyInstaller build.
+numpy>=1.24,<3
+opencv-python>=4.8,<5
+Pillow>=10.0,<13
+torch>=2.0,<3
+send2trash>=1.8,<3
+imagehash>=4.3,<5
+clip @ git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6
 # Optional VLM backends — install only the families you want to use:
-#   open_clip_torch     # for openclip:* embedders
-#   transformers        # for siglip:* / dinov2:* and caption-based API embedders
-#   requests            # for any API-backed embedder (jina/voyage/qwen-vl/openai/anthropic/gemini)
+#   open_clip_torch>=2.20,<4   # for openclip:* embedders
+#   transformers>=4.40,<6      # for siglip:* / dinov2:* and caption-based API embedders
+#   requests>=2.28,<3          # for any API-backed embedder (jina/voyage/qwen-vl/openai/anthropic/gemini)

@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -238,6 +239,54 @@ def _require_requests() -> None:
                            "Install with: pip install requests")
 
 
+RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 5
+BACKOFF_BASE = 2.0
+BACKOFF_MAX = 60.0
+
+
+def _retry_delay(attempt: int, response=None) -> float:
+    """Seconds to wait before the next attempt; honors a numeric Retry-After."""
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(BACKOFF_MAX, max(0.0, float(retry_after)))
+            except ValueError:
+                pass
+    return min(BACKOFF_MAX, BACKOFF_BASE ** attempt)
+
+
+def _post_with_retry(url: str, **kwargs):
+    """requests.post with exponential backoff on rate limits, 5xx and network errors.
+
+    Raises the last error once MAX_ATTEMPTS is exhausted; 4xx other than
+    408/429 are raised immediately since retrying won't help.
+    """
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            r = requests.post(url, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt == MAX_ATTEMPTS:
+                raise
+            delay = _retry_delay(attempt)
+            # Log only the exception type: its message embeds the full URL,
+            # which carries the API key for Gemini.
+            logger.warning("POST %s failed (%s); retry %d/%d in %.0fs",
+                           url.split("?")[0], type(e).__name__, attempt,
+                           MAX_ATTEMPTS - 1, delay)
+        else:
+            if r.status_code not in RETRY_STATUS or attempt == MAX_ATTEMPTS:
+                r.raise_for_status()
+                return r
+            delay = _retry_delay(attempt, r)
+            logger.warning("POST %s returned %d; retry %d/%d in %.0fs",
+                           url.split("?")[0], r.status_code, attempt,
+                           MAX_ATTEMPTS - 1, delay)
+        time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def _l2_normalize(x: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
     return (x / norms).astype(np.float32)
@@ -251,13 +300,12 @@ def _jina_embed(api_key: str, model_id: str, pil_images: list) -> np.ndarray:
         "model": model_id,
         "input": [{"image": _pil_to_b64_jpeg(img)} for img in pil_images],
     }
-    r = requests.post(
+    r = _post_with_retry(
         "https://api.jina.ai/v1/embeddings",
         headers={"Authorization": f"Bearer {api_key}",
                  "Content-Type": "application/json"},
         json=payload, timeout=120,
     )
-    r.raise_for_status()
     data = r.json()
     embs = [d["embedding"] for d in data["data"]]
     return _l2_normalize(np.array(embs, dtype=np.float32))
@@ -272,14 +320,13 @@ def _voyage_embed(api_key: str, model_id: str, pil_images: list) -> np.ndarray:
             "type": "image_base64",
             "image_base64": f"data:image/jpeg;base64,{b64}",
         }]})
-    r = requests.post(
+    r = _post_with_retry(
         "https://api.voyageai.com/v1/multimodalembeddings",
         headers={"Authorization": f"Bearer {api_key}",
                  "Content-Type": "application/json"},
         json={"model": model_id, "inputs": inputs, "input_type": "document"},
         timeout=120,
     )
-    r.raise_for_status()
     data = r.json()
     embs = [d["embedding"] for d in data["data"]]
     return _l2_normalize(np.array(embs, dtype=np.float32))
@@ -290,7 +337,7 @@ def _voyage_embed(api_key: str, model_id: str, pil_images: list) -> np.ndarray:
 def _qwen_caption(api_key: str, model_id: str, pil_image: Image.Image) -> str:
     _require_requests()
     b64 = _pil_to_b64_jpeg(pil_image)
-    r = requests.post(
+    r = _post_with_retry(
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}",
                  "Content-Type": "application/json"},
@@ -309,14 +356,13 @@ def _qwen_caption(api_key: str, model_id: str, pil_image: Image.Image) -> str:
         },
         timeout=180,
     )
-    r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
 
 
 def _openai_caption(api_key: str, model_id: str, pil_image: Image.Image) -> str:
     _require_requests()
     b64 = _pil_to_b64_jpeg(pil_image)
-    r = requests.post(
+    r = _post_with_retry(
         "https://api.openai.com/v1/chat/completions",
         headers={"Authorization": f"Bearer {api_key}",
                  "Content-Type": "application/json"},
@@ -335,14 +381,13 @@ def _openai_caption(api_key: str, model_id: str, pil_image: Image.Image) -> str:
         },
         timeout=180,
     )
-    r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
 
 
 def _anthropic_caption(api_key: str, model_id: str, pil_image: Image.Image) -> str:
     _require_requests()
     b64 = _pil_to_b64_jpeg(pil_image)
-    r = requests.post(
+    r = _post_with_retry(
         "https://api.anthropic.com/v1/messages",
         headers={
             "x-api-key": api_key,
@@ -366,7 +411,6 @@ def _anthropic_caption(api_key: str, model_id: str, pil_image: Image.Image) -> s
         },
         timeout=180,
     )
-    r.raise_for_status()
     data = r.json()
     # content is a list of blocks; concatenate text blocks
     return "".join(b.get("text", "") for b in data["content"]
@@ -378,7 +422,7 @@ def _gemini_caption(api_key: str, model_id: str, pil_image: Image.Image) -> str:
     b64 = _pil_to_b64_jpeg(pil_image)
     url = (f"https://generativelanguage.googleapis.com/v1beta/"
            f"models/{model_id}:generateContent?key={api_key}")
-    r = requests.post(
+    r = _post_with_retry(
         url,
         headers={"Content-Type": "application/json"},
         json={
@@ -390,7 +434,6 @@ def _gemini_caption(api_key: str, model_id: str, pil_image: Image.Image) -> str:
         },
         timeout=180,
     )
-    r.raise_for_status()
     data = r.json()
     parts = data["candidates"][0]["content"]["parts"]
     return "".join(p.get("text", "") for p in parts).strip()
@@ -456,11 +499,9 @@ class _CaptionAPIEmbedder:
             if cached is not None:
                 out[i] = cached
                 continue
-            try:
-                caption = self._caption_fn(self.api_key, self.spec.model_id, img)
-            except Exception as e:
-                logger.warning("Caption failed for image %d (%s): %s", i, self.family, e)
-                caption = ""
+            # Let failures propagate: a blank caption would be cached and would
+            # make every failed image a "duplicate" of every other one.
+            caption = self._caption_fn(self.api_key, self.spec.model_id, img)
             pending_idx.append(i)
             pending_captions.append(caption or " ")
             pending_h.append(h)

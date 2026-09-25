@@ -12,15 +12,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from genowCleaner import (  # noqa: E402
     Config,
-    UnionFind,
     analyze_image_quality,
     cluster_by_similarity,
+    FORMAT_IMAGES,
+    FORMAT_YOLO,
+    cluster_splits,
     collect_images,
+    detect_dataset_format,
+    keep_priority,
     quality_score,
     remove_yolo_pair,
     validate_yolo_dataset,
     write_report,
     yolo_label_path,
+    yolo_split,
 )
 
 
@@ -48,14 +53,6 @@ def _make_yolo_dataset(root: Path, splits=("train", "val")) -> None:
         _make_image(img)
         lbl.parent.mkdir(parents=True, exist_ok=True)
         lbl.write_text("0 0.5 0.5 0.2 0.2\n")
-
-
-def test_union_find_basic():
-    uf = UnionFind(5)
-    uf.union(0, 1)
-    uf.union(1, 2)
-    assert uf.find(0) == uf.find(2)
-    assert uf.find(3) != uf.find(0)
 
 
 def test_quality_score_handles_empty():
@@ -108,6 +105,27 @@ def test_cluster_by_similarity_groups_identical():
     assert sorted(clusters[0]) == [0, 1, 2]
 
 
+def _unit(angle_deg: float) -> np.ndarray:
+    a = np.deg2rad(angle_deg)
+    return np.array([np.cos(a), np.sin(a)], dtype=np.float32)
+
+
+def test_cluster_by_similarity_does_not_chain():
+    # cos(20°)≈0.94 > 0.9 for neighbors, cos(40°)≈0.77 < 0.9 for A–C.
+    embeddings = np.stack([_unit(0), _unit(20), _unit(40)])
+    clusters = cluster_by_similarity(embeddings, threshold=0.9)
+    assert clusters == [[0, 1]]
+
+
+def test_cluster_by_similarity_leader_follows_order():
+    embeddings = np.stack([_unit(0), _unit(20), _unit(40)])
+    clusters = cluster_by_similarity(embeddings, threshold=0.9, order=[1, 0, 2])
+    # B is visited first and is similar to both A and C.
+    assert len(clusters) == 1
+    assert clusters[0][0] == 1
+    assert sorted(clusters[0]) == [0, 1, 2]
+
+
 def test_cluster_by_similarity_empty():
     embeddings = np.zeros((1, 512), dtype=np.float32)
     assert cluster_by_similarity(embeddings, 0.9) == []
@@ -145,6 +163,42 @@ def test_validate_yolo_dataset_rejects_yaml_without_yolo_keys(tmp_path):
     assert not ok
 
 
+def test_detect_dataset_format_yolo(tmp_path):
+    _make_yolo_dataset(tmp_path)
+    fmt, _ = detect_dataset_format(tmp_path)
+    assert fmt == FORMAT_YOLO
+
+
+def test_detect_dataset_format_plain_folder(tmp_path):
+    _make_image(tmp_path / "a.png")
+    fmt, _ = detect_dataset_format(tmp_path)
+    assert fmt == FORMAT_IMAGES
+
+
+def test_detect_dataset_format_rejects_missing_dir(tmp_path):
+    fmt, reason = detect_dataset_format(tmp_path / "nope")
+    assert fmt is None
+    assert "Not a directory" in reason
+
+
+def test_collect_images_keeps_labels_dir_for_plain_folder(tmp_path):
+    _make_image(tmp_path / "labels" / "a.png")
+    assert collect_images(tmp_path) == []
+    assert collect_images(tmp_path, skip_labels=False) == [tmp_path / "labels" / "a.png"]
+
+
+def test_remove_without_label_keeps_sibling_txt(tmp_path):
+    img = tmp_path / "a.png"
+    txt = tmp_path / "a.txt"
+    _make_image(img)
+    txt.write_text("caption")
+    count, _ = remove_yolo_pair(img, use_trash=False,
+                                quarantine_dir=tmp_path / "q", with_label=False)
+    assert count == 1
+    assert not img.exists()
+    assert txt.exists()
+
+
 def test_yolo_label_path_swaps_images_to_labels():
     img = Path("/data/proj/images/train/sub/x.jpg")
     assert yolo_label_path(img) == Path("/data/proj/labels/train/sub/x.txt")
@@ -158,6 +212,39 @@ def test_yolo_label_path_uses_rightmost_images_segment():
 def test_yolo_label_path_falls_back_to_sibling_txt():
     img = Path("/some/dir/x.jpg")
     assert yolo_label_path(img) == Path("/some/dir/x.txt")
+
+
+def test_yolo_split_layouts():
+    assert yolo_split(Path("/d/images/train/x.jpg")) == "train"
+    assert yolo_split(Path("/d/valid/images/x.jpg")) == "val"
+    assert yolo_split(Path("/d/images/test/sub/x.jpg")) == "test"
+    assert yolo_split(Path("/d/images/x.jpg")) is None
+
+
+def test_keep_priority_prefers_eval_split_over_quality():
+    train = Path("/d/images/train/a.jpg")
+    val = Path("/d/images/val/a.jpg")
+    quality = {
+        train: {"blur": 900.0, "brightness": 128.0, "std": 60.0, "pixels": 10**6},
+        val: {"blur": 5.0, "brightness": 128.0, "std": 10.0, "pixels": 10**4},
+    }
+    assert sorted([train, val], key=lambda p: keep_priority(p, quality))[0] == val
+
+
+def test_keep_priority_uses_quality_within_split():
+    sharp = Path("/d/images/train/a.jpg")
+    blurry = Path("/d/images/train/b.jpg")
+    quality = {
+        sharp: {"blur": 900.0, "brightness": 128.0, "std": 60.0, "pixels": 10**4},
+        blurry: {"blur": 5.0, "brightness": 128.0, "std": 60.0, "pixels": 10**4},
+    }
+    assert sorted([blurry, sharp], key=lambda p: keep_priority(p, quality))[0] == sharp
+
+
+def test_cluster_splits():
+    members = [Path("/d/images/val/a.jpg"), Path("/d/images/train/a.jpg"),
+               Path("/d/images/train/b.jpg")]
+    assert cluster_splits(members) == ["train", "val"]
 
 
 def test_remove_yolo_pair_quarantines_image_and_label(tmp_path):
@@ -215,8 +302,13 @@ def test_write_report_structure(tmp_path):
     data = json.loads(out.read_text())
     assert data["schema"] == 2
     assert data["dataset_format"] == "YOLOv11/v12"
+
+    results["dataset_format"] = FORMAT_IMAGES
+    write_report(out, tmp_path, results, cfg)
+    assert json.loads(out.read_text())["dataset_format"] == "image folder"
     assert data["categories"]["blurry"][0]["score"] == 5.0
     assert data["duplicate_clusters"][0][0]["quality_score"] == 1.23
+    assert data["duplicate_clusters"][0][0]["split"] == "train"
 
 
 def test_config_roundtrip(tmp_path, monkeypatch):
@@ -316,3 +408,70 @@ def test_image_embed_cache_roundtrip_and_persistence(tmp_path):
     c2 = ImageEmbedCache("jina:clip-v2", cache_dir=tmp_path)
     assert c2.get("abc") == [0.1, 0.2, 0.3]
     assert len(c2) == 1
+
+
+# ----- API retry (no network) -----
+
+class _FakeResponse:
+    def __init__(self, status: int, headers=None):
+        self.status_code = status
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+def _patch_post(monkeypatch, responses):
+    import api_embedders
+    calls = []
+    sleeps = []
+
+    def fake_post(url, **kwargs):
+        calls.append(url)
+        r = responses[len(calls) - 1]
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    monkeypatch.setattr(api_embedders.requests, "post", fake_post)
+    monkeypatch.setattr(api_embedders.time, "sleep", sleeps.append)
+    return calls, sleeps
+
+
+def test_post_with_retry_recovers_from_429_and_honors_retry_after(monkeypatch):
+    pytest.importorskip("requests")
+    from api_embedders import _post_with_retry
+    calls, sleeps = _patch_post(monkeypatch, [
+        _FakeResponse(429, {"Retry-After": "7"}), _FakeResponse(503), _FakeResponse(200)])
+    r = _post_with_retry("https://x/y")
+    assert r.status_code == 200
+    assert len(calls) == 3
+    assert sleeps == [7.0, 4.0]
+
+
+def test_post_with_retry_retries_network_errors(monkeypatch):
+    requests = pytest.importorskip("requests")
+    from api_embedders import _post_with_retry
+    calls, _ = _patch_post(monkeypatch, [
+        requests.ConnectionError("boom"), _FakeResponse(200)])
+    assert _post_with_retry("https://x/y").status_code == 200
+    assert len(calls) == 2
+
+
+def test_post_with_retry_does_not_retry_client_errors(monkeypatch):
+    pytest.importorskip("requests")
+    from api_embedders import _post_with_retry
+    calls, sleeps = _patch_post(monkeypatch, [_FakeResponse(401)])
+    with pytest.raises(RuntimeError):
+        _post_with_retry("https://x/y")
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_post_with_retry_gives_up(monkeypatch):
+    pytest.importorskip("requests")
+    import api_embedders
+    calls, _ = _patch_post(monkeypatch, [_FakeResponse(500)] * api_embedders.MAX_ATTEMPTS)
+    with pytest.raises(RuntimeError):
+        api_embedders._post_with_retry("https://x/y")
+    assert len(calls) == api_embedders.MAX_ATTEMPTS

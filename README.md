@@ -1,12 +1,15 @@
 # GenowDatasetCleaner
 
-**GenowDatasetCleaner** est une application de bureau (Python + Tkinter) conçue pour nettoyer et organiser des datasets d'images au format **YOLOv11 / YOLOv12** (Ultralytics). Elle détecte les images de mauvaise qualité (floues, sur/sous-exposées, peu informatives) et les doublons à l'aide d'embeddings visuels (**CLIP** par défaut, plusieurs autres VLM disponibles), puis permet de les supprimer en conservant les fichiers de labels YOLO (`.txt`) associés.
+**GenowDatasetCleaner** est une application de bureau (Python + Tkinter) conçue pour nettoyer et organiser des datasets d'images : **n'importe quel dossier d'images** ou un dataset au format **YOLOv11 / YOLOv12** (Ultralytics). Elle détecte les images de mauvaise qualité (floues, sur/sous-exposées, peu informatives) et les doublons à l'aide d'embeddings visuels (**CLIP** par défaut, plusieurs autres VLM disponibles), puis permet de les supprimer (avec leurs fichiers de labels YOLO `.txt` associés dans le cas d'un dataset YOLO).
 
-Un dossier est reconnu comme dataset YOLO s'il contient soit un `data.yaml` avec les clés `train:` et `names:`/`nc:`, soit des répertoires parallèles `images/` et `labels/`.
+Le format YOLO **n'est pas obligatoire** :
+
+*   **Dataset YOLO** — un dossier contenant soit un `data.yaml` avec les clés `train:` et `names:`/`nc:`, soit des répertoires parallèles `images/` et `labels/`. La suppression d'une image retire aussi son label `.txt`, et les splits `train`/`val`/`test` sont pris en compte pour l'auto-clean.
+*   **Dossier d'images quelconque** — tout autre dossier est analysé comme une simple collection d'images (parcours récursif). Seules les images sont supprimées ; aucun autre fichier n'est touché.
 
 ## Fonctionnalités
 
-*   **Détection de doublons**: pré-passe par hachage perceptuel (pHash) pour les doublons exacts, puis clustering par similarité cosinus sur les embeddings VLM.
+*   **Détection de doublons**: pré-passe par hachage perceptuel (pHash) pour les doublons exacts, puis clustering par similarité cosinus sur les embeddings VLM. Chaque image d'un cluster ressemble à l'image conservée (pas de chaînage A≈B≈C).
 *   **Embedders multiples** (sélectionnables dans l'interface ou via `--embedder`):
     *   **CLIP** ViT-B/32, ViT-B/16, ViT-L/14 (OpenAI, par défaut).
     *   **OpenCLIP** (nécessite `open_clip_torch`).
@@ -73,8 +76,8 @@ Listées dans `requirements.txt`.
 python genowCleaner.py
 ```
 
-1.  **Sélectionner le dataset**: cliquez sur "Browse…" pour choisir le dossier racine du dataset YOLO.
-2.  **Régler les paramètres** (seuils de flou, luminosité, doublons, embedder, nombre de workers, clés API…).
+1.  **Sélectionner le dataset**: cliquez sur "Browse…" pour choisir le dossier racine du dataset (YOLO ou simple dossier d'images).
+2.  **Régler les paramètres** (seuils de flou, luminosité, doublons, embedder, nombre de workers, clés API…). Changer d'embedder le recharge immédiatement en arrière-plan ; en cas d'échec (clé API manquante, dépendance absente), l'embedder précédent est restauré.
 3.  **Lancer l'analyse**: "Analyze dataset". L'application va:
     *   Collecter les images (`.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`).
     *   Signaler les fichiers contenant `det` / `seg` (optionnel).
@@ -82,9 +85,13 @@ python genowCleaner.py
     *   Calculer les embeddings et regrouper les doublons.
 4.  **Visualiser et nettoyer**:
     *   Les cartes de résultats affichent le nombre d'images par catégorie.
-    *   "Review" pour inspecter et sélectionner les images à supprimer.
-    *   "Auto-clean" pour conserver automatiquement la meilleure image de chaque cluster de doublons.
-    *   La suppression retire aussi le fichier de label YOLO (`.txt`) associé. "Undo last delete" restaure la dernière suppression (quarantaine uniquement).
+    *   "Review" pour inspecter et sélectionner les images à supprimer (aucune n'est cochée par défaut). Les fenêtres sont paginées (50 images ou 15 clusters par page). Cliquer sur une miniature l'affiche en grand (←/→ pour naviguer, Suppr pour cocher/décocher, Échap pour fermer).
+    *   Raccourcis clavier des fenêtres de revue : Échap fermer · ←/→ page précédente/suivante · Suppr supprimer la sélection · Ctrl+A / Ctrl+D tout sélectionner / rien (pour les doublons : inclure / ignorer tous les clusters).
+    *   Dans la revue des doublons, cochez "Keep this" sur **une ou plusieurs** images par cluster (la première est cochée par défaut) ; seules les images non cochées sont supprimées. Au moins une image doit rester cochée — "Skip this cluster" conserve tout le cluster.
+    *   "Clean all problems" supprime en une fois toutes les images signalées (toutes catégories) et toutes les copies en double sauf une par cluster, après confirmation détaillée.
+    *   "Auto-clean" pour conserver automatiquement une image par cluster de doublons : la copie en `test`/`val` est prioritaire sur `train` (évite de vider les splits d'évaluation), puis la meilleure qualité. Les clusters répartis sur plusieurs splits (fuite train/val/test) sont signalés.
+    *   Pour un dataset YOLO, la suppression retire aussi le fichier de label (`.txt`) associé. "Undo last delete" restaure la dernière suppression (quarantaine uniquement).
+    *   "Open reports" ouvre le dossier des rapports JSON (`~/.genow_cleaner/reports/`).
 
 ### Mode CLI (sans affichage)
 
@@ -95,7 +102,7 @@ python genowCleaner.py --cli /chemin/vers/dataset
 Options principales:
 
 *   `--report CHEMIN` — emplacement du rapport JSON (par défaut `~/.genow_cleaner/reports/`).
-*   `--auto-clean-duplicates` — conserve la meilleure image par cluster, supprime les autres.
+*   `--auto-clean-duplicates` — conserve une image par cluster (copie `test`/`val` d'abord, puis meilleure qualité), supprime les autres.
 *   `--embedder CLE` — choix de l'embedder (ex. `clip:ViT-B/32`, `dinov2:base`…).
 *   `--blur-threshold`, `--dark-threshold`, `--bright-threshold`, `--low-info-threshold`, `--duplicate-threshold` — seuils.
 *   `--workers N` — nombre de threads.
